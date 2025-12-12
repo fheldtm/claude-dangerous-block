@@ -228,6 +228,30 @@ def extract_target_path_from_command(command):
         if remove_match:
             target = remove_match.group(1).strip()
 
+    # find /path -delete
+    if not target:
+        find_match = re.match(r"^\s*find\s+(.+?)\s+.*-delete", command, re.IGNORECASE)
+        if find_match:
+            target = find_match.group(1).split()[0]
+
+    # gio trash /path
+    if not target:
+        gio_match = re.match(r"^\s*gio\s+trash\s+(.+)$", command, re.IGNORECASE)
+        if gio_match:
+            target = gio_match.group(1).split()[0]
+
+    # git clean -fd /path or git clean -f /path (in specified directory)
+    if not target:
+        git_match = re.match(r"^\s*git\s+clean\s+(-[fdDx]+\s+)*(.+)?", command, re.IGNORECASE)
+        if git_match:
+            path_part = git_match.group(2)
+            if path_part:
+                target = path_part.split()[0]
+            else:
+                # git clean without explicit path - affects current directory
+                # We'll mark this as "." to be resolved against cwd
+                target = "."
+
     if target:
         target = target.strip('"').strip("'")
 
@@ -275,7 +299,7 @@ def check_command(command, cwd):
                     effective_cwd = effective_cwd[0].upper() + effective_cwd[1:]
             continue
 
-        if re.match(r"^\s*(rm|del|rmdir|rd|Remove-Item)\s+", sub_cmd, re.IGNORECASE):
+        if re.match(r"^\s*(rm|del|rmdir|rd|Remove-Item|find|gio|git\s+clean)\s+", sub_cmd, re.IGNORECASE):
             target_path = extract_target_path_from_command(sub_cmd)
 
             if not target_path:
