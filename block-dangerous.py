@@ -3,12 +3,280 @@
 Dangerous command blocker for Claude Code
 Detects and blocks potentially destructive commands on different operating systems
 Uses cwd-based path validation to restrict operations to current project directory
+Includes script content inspection for Claude Code analysis
 """
 import json
 import sys
 import re
 import platform
 import os
+import urllib.request
+import urllib.error
+import ssl
+
+
+# ============================================================================
+# Script Execution Detection
+# ============================================================================
+
+# 스크립트 실행 패턴
+SCRIPT_EXECUTION_PATTERNS = [
+    # bash/sh/zsh script.sh
+    r"^\s*(bash|sh|zsh)\s+(.+\.sh)\s*$",
+    r"^\s*(bash|sh|zsh)\s+(.+\.sh)\s+",
+    # ./script.sh or /path/to/script.sh (직접 실행)
+    r"^\s*(\./[^\s]+\.sh)\s*$",
+    r"^\s*(\./[^\s]+\.sh)\s+",
+    r"^\s*(/[^\s]+\.sh)\s*$",
+    r"^\s*(/[^\s]+\.sh)\s+",
+    # source script.sh or . script.sh
+    r"^\s*(source|\.) +(.+\.sh)\s*$",
+]
+
+
+def extract_script_path(command, cwd):
+    """
+    Extract script path from command if it's a script execution
+    Returns: (script_path, absolute_script_path) or (None, None)
+    """
+    command = command.strip()
+
+    # bash/sh/zsh script.sh
+    match = re.match(r"^\s*(bash|sh|zsh)\s+([^\s]+\.sh)", command)
+    if match:
+        script_path = match.group(2).strip('"').strip("'")
+        abs_path = resolve_path_to_absolute(cwd, script_path)
+        return script_path, abs_path
+
+    # ./script.sh (직접 실행)
+    match = re.match(r"^\s*(\./[^\s]+\.sh)", command)
+    if match:
+        script_path = match.group(1)
+        abs_path = resolve_path_to_absolute(cwd, script_path)
+        return script_path, abs_path
+
+    # /absolute/path/script.sh (절대 경로 실행)
+    match = re.match(r"^\s*(/[^\s]+\.sh)", command)
+    if match:
+        script_path = match.group(1)
+        abs_path = normalize_path(script_path)
+        return script_path, abs_path
+
+    # source script.sh or . script.sh
+    match = re.match(r"^\s*(source|\.) +([^\s]+\.sh)", command)
+    if match:
+        script_path = match.group(2).strip('"').strip("'")
+        abs_path = resolve_path_to_absolute(cwd, script_path)
+        return script_path, abs_path
+
+    return None, None
+
+
+def read_script_content(script_path, max_lines=50):
+    """
+    Read script content for inspection
+    Returns: script content string or error message
+    """
+    try:
+        # normalize path for reading
+        actual_path = script_path.replace("/", os.sep) if os.name == "nt" else script_path
+
+        if not os.path.exists(actual_path):
+            return f"[파일 없음: {script_path}]"
+
+        if not os.path.isfile(actual_path):
+            return f"[파일이 아님: {script_path}]"
+
+        with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+
+        if len(lines) > max_lines:
+            content = ''.join(lines[:max_lines])
+            content += f"\n... ({len(lines) - max_lines}줄 더 있음)"
+        else:
+            content = ''.join(lines)
+
+        return content.strip()
+    except Exception as e:
+        return f"[읽기 오류: {str(e)}]"
+
+
+def check_script_execution(command, cwd):
+    """
+    Check if command is executing a script and return content for inspection
+    Returns: (should_block, message) tuple
+    """
+    script_path, abs_path = extract_script_path(command, cwd)
+
+    if not script_path:
+        return False, None
+
+    # 스크립트 내용 읽기
+    # abs_path는 normalized (lowercase) 되어있으므로 원본 경로 사용
+    if script_path.startswith('/'):
+        read_path = script_path
+    elif script_path.startswith('./'):
+        read_path = os.path.join(cwd, script_path[2:])
+    else:
+        read_path = os.path.join(cwd, script_path)
+
+    content = read_script_content(read_path)
+
+    message = f"""스크립트 실행 감지됨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📄 파일: {script_path}
+📍 경로: {read_path}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 내용:
+{content}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  Claude Code: 위 스크립트 내용을 분석하여 안전한지 판단하세요.
+    위험한 명령이 포함되어 있으면 실행을 거부하세요."""
+
+    return True, message
+
+
+# ============================================================================
+# Remote Script Execution Detection
+# ============================================================================
+
+REMOTE_SCRIPT_PATTERNS = [
+    # curl/wget ... | sh/bash
+    r"(curl|wget)\s+[^\|]+\|\s*(sh|bash|zsh)",
+    # curl/wget ... && (./script or sh script or chmod +x)
+    r"(curl|wget)\s+.+&&\s*(\./|sh\s+|bash\s+|zsh\s+|chmod\s+\+x)",
+    # curl/wget ... ; (./script or sh script or chmod +x)
+    r"(curl|wget)\s+.+;\s*(\./|sh\s+|bash\s+|zsh\s+|chmod\s+\+x)",
+    # sh/bash <(curl/wget ...)
+    r"(sh|bash|zsh)\s+<\(.*?(curl|wget)",
+    # source <(curl/wget ...)
+    r"(source|\.)\s+<\(.*?(curl|wget)",
+]
+
+
+def extract_url_from_command(command):
+    """
+    Extract URL from curl/wget command
+    Returns: URL string or None
+    """
+    # 가장 간단한 방법: URL 패턴을 직접 찾기
+    url_pattern = r"['\"]?(https?://[^\s'\"|\)]+)['\"]?"
+
+    # curl 명령에서 URL 찾기
+    if re.search(r"\bcurl\b", command, re.IGNORECASE):
+        match = re.search(url_pattern, command)
+        if match:
+            url = match.group(1).rstrip("'\"")
+            # 파이프나 리다이렉션 문자 제거
+            url = re.sub(r'[|><&;].*$', '', url)
+            return url.strip()
+
+    # wget 명령에서 URL 찾기
+    if re.search(r"\bwget\b", command, re.IGNORECASE):
+        match = re.search(url_pattern, command)
+        if match:
+            url = match.group(1).rstrip("'\"")
+            url = re.sub(r'[|><&;].*$', '', url)
+            return url.strip()
+
+    return None
+
+
+def download_remote_script(url, max_size=100000):
+    """
+    Download script content from URL
+    Returns: (content, error_message)
+    """
+    try:
+        # SSL context (allow self-signed for some cases)
+        ctx = ssl.create_default_context()
+
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (compatible; Claude-Code-Inspector/1.0)'
+        })
+
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+            content_length = response.headers.get('Content-Length')
+            if content_length and int(content_length) > max_size:
+                return None, f"파일이 너무 큽니다 ({int(content_length)} bytes)"
+
+            content = response.read(max_size).decode('utf-8', errors='replace')
+            return content, None
+
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP 오류: {e.code}"
+    except urllib.error.URLError as e:
+        return None, f"URL 오류: {e.reason}"
+    except Exception as e:
+        return None, f"다운로드 오류: {str(e)}"
+
+
+def check_remote_script_execution(command):
+    """
+    Check if command is executing a remote script and download content for inspection
+    Returns: (should_block, message) tuple
+    """
+    # Check if command matches remote script execution patterns
+    is_remote_script = False
+    for pattern in REMOTE_SCRIPT_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            is_remote_script = True
+            break
+
+    if not is_remote_script:
+        return False, None
+
+    # Extract URL
+    url = extract_url_from_command(command)
+    if not url:
+        return True, """원격 스크립트 실행 감지됨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  URL을 추출할 수 없습니다.
+    스크립트를 먼저 다운로드하여 내용을 확인하세요."""
+
+    # Download script content
+    content, error = download_remote_script(url)
+
+    if error:
+        message = f"""원격 스크립트 실행 감지됨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📄 URL: {url}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+❌ 다운로드 실패: {error}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  스크립트 내용을 확인할 수 없습니다.
+    수동으로 다운로드하여 내용을 확인한 후 실행하세요:
+
+    1. curl -sSf {url} -o /tmp/install_script.sh
+    2. cat /tmp/install_script.sh  # 내용 확인
+    3. chmod +x /tmp/install_script.sh && /tmp/install_script.sh"""
+        return True, message
+
+    # Truncate if too long
+    lines = content.split('\n')
+    if len(lines) > 80:
+        display_content = '\n'.join(lines[:80])
+        display_content += f"\n\n... ({len(lines) - 80}줄 더 있음)"
+    else:
+        display_content = content
+
+    message = f"""원격 스크립트 실행 감지됨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📄 URL: {url}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 스크립트 내용:
+{display_content}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  Claude Code: 위 스크립트 내용을 분석하여 안전한지 판단하세요.
+
+    ✅ 안전하다고 판단되면 다음 단계로 실행하세요:
+    1. curl -sSf {url} -o /tmp/install_script.sh
+    2. chmod +x /tmp/install_script.sh
+    3. /tmp/install_script.sh
+
+    ❌ 위험하다고 판단되면 실행을 거부하세요."""
+
+    return True, message
 
 
 # ============================================================================
@@ -31,25 +299,21 @@ def get_os_type():
 # ============================================================================
 
 ABSOLUTE_DANGEROUS_PATTERNS = [
-    # ===== 원격 코드 실행 =====
-    (r"(wget|curl)\s+.*\|\s*(sh|bash|zsh|powershell|cmd)", "원격 스크립트 파이프 실행"),
-    (r"(sh|bash|zsh)\s+<\(.*?(wget|curl)", "프로세스 치환으로 원격 스크립트 실행"),
-    (r"(curl|wget)\s+.*&&\s*(\./|sh\s+|bash\s+|zsh\s+|chmod\s+\+x|powershell)", "다운로드 후 즉시 실행"),
-    (r"(curl|wget)\s+.*;\s*(\./|sh\s+|bash\s+|zsh\s+|chmod\s+\+x|powershell)", "다운로드 후 즉시 실행"),
+    # ===== 원격 코드 실행 (Windows PowerShell - 분석 어려움) =====
     (r"iex\s+\(.*?(curl|wget|Invoke-WebRequest)", "PowerShell로 원격 코드 실행"),
     (r"Invoke-Expression\s+.*?(Invoke-WebRequest|DownloadString)", "원격 코드 실행"),
     (r"DownloadString.*\|\s*iex", "원격 파일 다운로드 후 실행"),
-    (r"eval.*\$\(.*?(curl|wget)", "eval로 원격 코드 실행"),
-    (r"base64\s+-d.*\|\s*(sh|bash|zsh)", "base64 디코딩 후 실행"),
-    (r"\|\s*xargs.*?(sh|bash|zsh)\s+-c", "xargs로 스크립트 실행"),
-    (r"(source|\.)\s+<\(.*?(curl|wget)", "source로 원격 스크립트 실행"),
-    (r"(python|python3|node|perl|ruby).*\$\(.*?(curl|wget)", "인터프리터로 원격 코드 실행"),
     (r"powershell\s+-EncodedCommand", "Base64 인코딩 코드 실행"),
     (r"cmd\s+/c\s+.*?(curl|wget|powershell|Invoke-WebRequest)", "cmd로 원격 코드 실행"),
 
-    # ===== 임시 디렉토리 스크립트 실행 =====
-    (r"(sh|bash|zsh)\s+/tmp/", "/tmp 스크립트 실행"),
-    (r"(powershell|cmd|python).*(%TEMP%|%TMP%|%LocalAppData%[\\\/]Temp|\$env:TEMP)", "임시 디렉토리 스크립트 실행"),
+    # ===== 기타 위험한 실행 =====
+    (r"eval.*\$\(.*?(curl|wget)", "eval로 원격 코드 실행"),
+    (r"base64\s+-d.*\|\s*(sh|bash|zsh)", "base64 디코딩 후 실행"),
+    (r"\|\s*xargs.*?(sh|bash|zsh)\s+-c", "xargs로 스크립트 실행"),
+    (r"(python|python3|node|perl|ruby).*\$\(.*?(curl|wget)", "인터프리터로 원격 코드 실행"),
+
+    # Note: curl/wget | sh, curl && ./script 등은 check_remote_script_execution()에서 처리
+    # 스크립트를 다운로드하여 내용을 분석한 후 안전 여부 판단
 
     # ===== 시스템 레벨 파괴 =====
     (r"mkfs\.", "디스크 포맷"),
@@ -135,7 +399,8 @@ ABSOLUTELY_PROTECTED_DIRS_MACOS = [
 def normalize_path(path):
     """Normalize path for comparison (handle both / and \\ separators)"""
     normalized = path.replace("\\", "/")
-    normalized = normalized.rstrip("/")
+    if normalized != "/":  # 루트 디렉토리는 유지
+        normalized = normalized.rstrip("/")
     return normalized.lower()
 
 
@@ -274,6 +539,12 @@ def check_command(command, cwd):
         if re.search(pattern, command, re.IGNORECASE):
             return message
 
+    # 1b. Check remote script execution (curl | sh, wget && ./script, etc.)
+    # 이 패턴들은 스크립트를 다운로드하여 내용을 분석한 후 안내함
+    is_remote, remote_message = check_remote_script_execution(command)
+    if is_remote:
+        return remote_message
+
     # 2. Split command by && or ; to check each part
     sub_commands = []
     for part in re.split(r'\s*&&\s*', command):
@@ -282,7 +553,7 @@ def check_command(command, cwd):
     # 3. Track effective cwd (updated by cd commands)
     effective_cwd = cwd
 
-    # 4. Validate delete/modification commands in each sub-command
+    # 4. Validate each sub-command
     for sub_cmd in sub_commands:
         sub_cmd = sub_cmd.strip()
         if not sub_cmd:
@@ -299,6 +570,12 @@ def check_command(command, cwd):
                     effective_cwd = effective_cwd[0].upper() + effective_cwd[1:]
             continue
 
+        # 4a. Check for script execution (스크립트 실행 검사)
+        is_script, script_message = check_script_execution(sub_cmd, effective_cwd)
+        if is_script:
+            return script_message
+
+        # 4b. Check delete/modification commands
         if re.match(r"^\s*(rm|del|rmdir|rd|Remove-Item|find|gio|git\s+clean)\s+", sub_cmd, re.IGNORECASE):
             target_path = extract_target_path_from_command(sub_cmd)
 
@@ -339,6 +616,15 @@ def main():
     reason = check_command(command, cwd)
 
     if reason:
+        # 스크립트 분석 정보인 경우 (차단하지 않고 정보만 전달)
+        if "스크립트 내용을 분석하여 안전한지 판단하세요" in reason:
+            print(json.dumps({
+                "decision": "allow",
+                "reason": reason
+            }))
+            sys.exit(0)
+
+        # 그 외는 차단
         print(json.dumps({
             "decision": "block",
             "reason": f"차단: {reason}"
